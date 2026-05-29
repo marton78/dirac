@@ -18,7 +18,6 @@ import type { ApiProvider } from "@shared/api"
 import type { DiracAsk, DiracMessage as DiracMessageType } from "@shared/ExtensionMessage"
 import { CLI_ONLY_COMMANDS, VSCODE_ONLY_COMMANDS } from "@shared/slashCommands"
 import { getProviderModelIdKey } from "@shared/storage/provider-keys"
-import { DiracEndpoint } from "@/config.js"
 import { Controller } from "@/core/controller"
 import { getAvailableSlashCommands } from "@/core/controller/slash/getAvailableSlashCommands"
 import { setRuntimeHooksDir } from "@/core/storage/disk"
@@ -40,6 +39,7 @@ import { filterOpenRouterModelIds } from "@/shared/utils/model-filters"
 import { getDefaultModelId, getModelList, hasStaticModels } from "../utils/model-metadata.js"
 import { fetchOpenRouterModels, usesOpenRouterModels } from "../utils/openrouter-models"
 import { getProviderLabel, getValidCliProviders, isValidCliProvider } from "../utils/providers.js"
+import { initCoreServices } from "../initCoreServices.js"
 import { CliContextResult, initializeCliContext } from "../vscode-context.js"
 import { DiracSessionEmitter } from "./DiracSessionEmitter.js"
 import { parseWebSearchMarkerText, translateMessage } from "./messageTranslator.js"
@@ -98,7 +98,7 @@ export class DiracAgent implements acp.Agent {
 		this.sessionEmitters.clear()
 	}
 	private readonly options: DiracAgentOptions
-	private readonly ctx: CliContextResult
+	private ctx!: CliContextResult
 
 	/** Map of active sessions by session ID */
 	public readonly sessions: Map<string, DiracAcpSession> = new Map()
@@ -133,7 +133,10 @@ export class DiracAgent implements acp.Agent {
 	constructor(options: DiracAgentOptions) {
 		this.options = options
 		setRuntimeHooksDir(options.hooksDir)
-		this.ctx = initializeCliContext({ diracDir: options.diracDir, workspaceDir: options.cwd })
+		// ctx is initialized lazily in initialize() so that IO failures (e.g. an
+		// unwritable --config path) surface as a JSON-RPC error response on
+		// `initialize` rather than killing the process before the client can
+		// observe anything.
 	}
 
 	/**
@@ -187,10 +190,12 @@ export class DiracAgent implements acp.Agent {
 	 * the connection. The agent returns its protocol version and capabilities.
 	 */
 	async initialize(params: acp.InitializeRequest, connection?: acp.AgentSideConnection): Promise<acp.InitializeResponse> {
+		this.ctx = initializeCliContext({ diracDir: this.options.diracDir, workspaceDir: this.options.cwd })
 		this.clientCapabilities = params.clientCapabilities
 		this.initializeHostProvider(this.clientCapabilities, connection)
-		await DiracEndpoint.initialize(this.ctx.EXTENSION_DIR)
-		await StateManager.initialize(this.ctx.storageContext)
+		// Shared with initializeCli — see initCoreServices for why both modes
+		// must route through it.
+		await initCoreServices({ extensionDir: this.ctx.EXTENSION_DIR, storageContext: this.ctx.storageContext })
 
 		return {
 			protocolVersion: PROTOCOL_VERSION,
