@@ -382,7 +382,7 @@ describe("translateMessage - say messages", () => {
 	})
 
 	describe("error messages", () => {
-		it("should translate say:error to agent_message_chunk with error prefix", () => {
+		it("should translate say:error to a failed tool_call lifecycle", () => {
 			const message = createDiracMessage({
 				type: "say",
 				say: "error",
@@ -391,12 +391,20 @@ describe("translateMessage - say messages", () => {
 
 			const result = translateMessage(message, sessionState)
 
-			expect(result.updates.length).toBeGreaterThanOrEqual(1)
-			const messageChunk = result.updates.find((u) => u.sessionUpdate === "agent_message_chunk")
-			expect(messageChunk).toBeDefined()
+			expect(result.updates).toHaveLength(2)
 
-			const chunk = messageChunk as acp.ContentChunk & { sessionUpdate: "agent_message_chunk" }
-			expect((chunk.content as acp.TextContent).text).toBe("Error: Failed to read file")
+			const toolCall = result.updates[0] as acp.ToolCall & { sessionUpdate: "tool_call" }
+			assertValidToolCall(toolCall)
+			expect(toolCall.sessionUpdate).toBe("tool_call")
+			expect(toolCall.status).toBe("in_progress")
+			expect(toolCall.kind).toBe("other")
+
+			const toolUpdate = result.updates[1] as acp.ToolCallUpdate & { sessionUpdate: "tool_call_update" }
+			assertValidToolCallUpdate(toolUpdate)
+			expect(toolUpdate.sessionUpdate).toBe("tool_call_update")
+			expect(toolUpdate.toolCallId).toBe(toolCall.toolCallId)
+			expect(toolUpdate.status).toBe("failed")
+			expect((toolUpdate as any).rawOutput).toEqual({ error: "Failed to read file" })
 		})
 
 		it("should update current tool call to failed status on error", () => {
@@ -431,8 +439,13 @@ describe("translateMessage - say messages", () => {
 
 			const result = translateMessage(message, sessionState)
 
-			const messageChunk = result.updates.find((u) => u.sessionUpdate === "agent_message_chunk")
-			expect(messageChunk).toBeDefined()
+			// Non-JSON error_retry text is treated as a plain retry: a tool_call in_progress
+			const toolCall = result.updates.find((u) => u.sessionUpdate === "tool_call")
+			expect(toolCall).toBeDefined()
+			assertValidToolCall(toolCall!)
+			const call = toolCall as acp.ToolCall & { sessionUpdate: "tool_call" }
+			expect(call.status).toBe("in_progress")
+			expect(sessionState.retryToolCallId).toBeDefined()
 		})
 
 		it("should handle diff_error message type", () => {
@@ -444,8 +457,20 @@ describe("translateMessage - say messages", () => {
 
 			const result = translateMessage(message, sessionState)
 
-			const messageChunk = result.updates.find((u) => u.sessionUpdate === "agent_message_chunk")
-			expect(messageChunk).toBeDefined()
+			// diff_error is rendered as a failed tool_call lifecycle
+			expect(result.updates).toHaveLength(2)
+
+			const toolCall = result.updates[0] as acp.ToolCall & { sessionUpdate: "tool_call" }
+			assertValidToolCall(toolCall)
+			expect(toolCall.sessionUpdate).toBe("tool_call")
+			expect(toolCall.status).toBe("in_progress")
+
+			const toolUpdate = result.updates[1] as acp.ToolCallUpdate & { sessionUpdate: "tool_call_update" }
+			assertValidToolCallUpdate(toolUpdate)
+			expect(toolUpdate.sessionUpdate).toBe("tool_call_update")
+			expect(toolUpdate.toolCallId).toBe(toolCall.toolCallId)
+			expect(toolUpdate.status).toBe("failed")
+			expect((toolUpdate as any).rawOutput).toEqual({ error: "Diff application failed" })
 		})
 	})
 

@@ -60,6 +60,49 @@ function generateToolCallId(): string {
 	return crypto.randomUUID()
 }
 
+/**
+ * Render a terminal error as a failed tool_call lifecycle so clients show
+ * error styling instead of treating the message as normal model output.
+ *
+ * If a tool call is already in flight, the existing one is failed (preserving
+ * the natural attribution). Otherwise a synthetic tool_call is emitted just to
+ * carry the failure update.
+ */
+function pushFailureToolCall(
+	updates: acp.SessionUpdate[],
+	sessionState: AcpSessionState,
+	title: string,
+	displayText: string,
+	rawOutput: Record<string, unknown>,
+): void {
+	if (sessionState.currentToolCallId) {
+		updates.push({
+			sessionUpdate: "tool_call_update",
+			toolCallId: sessionState.currentToolCallId,
+			status: "failed",
+			content: [{ type: "content", content: { type: "text", text: displayText } }],
+			rawOutput,
+		})
+		sessionState.currentToolCallId = undefined
+		return
+	}
+	const toolCallId = generateToolCallId()
+	updates.push({
+		sessionUpdate: "tool_call",
+		toolCallId,
+		title,
+		kind: "other",
+		status: "in_progress",
+	})
+	updates.push({
+		sessionUpdate: "tool_call_update",
+		toolCallId,
+		status: "failed",
+		content: [{ type: "content", content: { type: "text", text: displayText } }],
+		rawOutput,
+	})
+}
+
 const WEB_SEARCH_MARKER_PATTERN = /^\s*\[Web Search:\s*([\s\S]*?)\]\s*$/
 const WEB_SEARCH_FALLBACK_QUERY = "Searching..."
 
@@ -226,6 +269,18 @@ function translateSayMessage(
 				}
 			}
 
+			// A retry chain ends successfully when the API actually starts
+			// returning content. Mark the open "Retrying API request" tool_call
+			// as completed so it doesn't linger as in_progress forever.
+			if (sessionState.retryToolCallId && message.text) {
+				updates.push({
+					sessionUpdate: "tool_call_update",
+					toolCallId: sessionState.retryToolCallId,
+					status: "completed",
+				})
+				sessionState.retryToolCallId = undefined
+			}
+
 			// Text messages → agent_message_chunk
 			if (message.text) {
 				updates.push({
@@ -278,27 +333,94 @@ function translateSayMessage(
 			break
 
 		case "error":
-		case "error_retry":
 		case "diff_error":
-		case "diracignore_error":
-			// Error messages → agent_message_chunk (errors are displayed as text)
-			if (message.text) {
-				updates.push({
-					sessionUpdate: "agent_message_chunk",
-					content: { type: "text", text: `Error: ${message.text}` },
-				})
+		case "diracignore_error": {
+			// Surface as a failed tool_call lifecycle so clients render error
+			// styling instead of plain white agent text.
+			if (!message.text) break
+			const title =
+				message.say === "diff_error"
+					? "File edit failed"
+					: message.say === "diracignore_error"
+						? "Access blocked by .diracignore"
+						: "Task error"
+			pushFailureToolCall(updates, sessionState, title, message.text, { error: message.text })
+			break
+		}
+
+		case "error_retry": {
+			// `error_retry` payload is JSON: {failed, attempt, maxAttempts, errorMessage}.
+			// In-flight retries collapse into a single evolving tool_call so the
+			// client shows one "Retrying API request" item that updates per
+			// attempt rather than three white text lines. The terminal
+			// "retries exhausted" message fails that same tool_call.
+			if (!message.text) break
+			const retry = (() => {
+				try {
+					return JSON.parse(message.text) as {
+						failed?: boolean
+						attempt?: number
+						maxAttempts?: number
+						errorMessage?: string
+					}
+				} catch {
+					return null
+				}
+			})()
+			// errorMessage is sometimes itself a JSON object — unwrap one level.
+			let errMsg = retry?.errorMessage ?? ""
+			if (errMsg) {
+				try {
+					const inner = JSON.parse(errMsg) as { message?: string }
+					errMsg = inner.message ?? errMsg
+				} catch {}
 			}
-			// Also update the current tool call if there is one
-			if (sessionState.currentToolCallId) {
+			const attemptN = retry?.attempt ?? "?"
+			const maxN = retry?.maxAttempts ?? "?"
+			const reasonText = errMsg || "request failed"
+
+			if (retry?.failed) {
+				const display = `Failed after ${maxN} retries: ${reasonText}`
+				if (sessionState.retryToolCallId) {
+					updates.push({
+						sessionUpdate: "tool_call_update",
+						toolCallId: sessionState.retryToolCallId,
+						status: "failed",
+						content: [{ type: "content", content: { type: "text", text: display } }],
+						rawOutput: { error: message.text },
+					})
+					sessionState.retryToolCallId = undefined
+				} else {
+					pushFailureToolCall(updates, sessionState, "Request failed", display, {
+						error: message.text,
+					})
+				}
+				break
+			}
+
+			const display = retry
+				? `Retrying... (attempt ${attemptN}/${maxN}): ${reasonText}`
+				: `Error: ${message.text}`
+			if (!sessionState.retryToolCallId) {
+				sessionState.retryToolCallId = generateToolCallId()
+				updates.push({
+					sessionUpdate: "tool_call",
+					toolCallId: sessionState.retryToolCallId,
+					title: "Retrying API request",
+					kind: "other",
+					status: "in_progress",
+					content: [{ type: "content", content: { type: "text", text: display } }],
+				})
+			} else {
 				updates.push({
 					sessionUpdate: "tool_call_update",
-					toolCallId: sessionState.currentToolCallId,
-					status: "failed",
-					rawOutput: { error: message.text },
+					toolCallId: sessionState.retryToolCallId,
+					status: "in_progress",
+					content: [{ type: "content", content: { type: "text", text: display } }],
 				})
-				sessionState.currentToolCallId = undefined
 			}
 			break
+		}
 
 		case "browser_action_launch":
 		case "browser_action":
@@ -651,8 +773,6 @@ function translateAskMessage(
 		case "condense":
 		case "summarize_task":
 		case "report_bug":
-		case "api_req_failed":
-		case "mistake_limit_reached":
 		case "command_output":
 			// These are typically handled internally or shown as messages
 			if (message.text) {
@@ -662,6 +782,25 @@ function translateAskMessage(
 				})
 			}
 			break
+
+		case "api_req_failed":
+		case "mistake_limit_reached": {
+			// streamingFailedMessage is a JSON envelope with a `message` field
+			// carrying the human-readable summary; fall back to the raw text.
+			if (!message.text) break
+			let displayText = message.text
+			try {
+				const parsed = JSON.parse(message.text)
+				if (typeof parsed?.message === "string") {
+					displayText = parsed.message
+				}
+			} catch {
+				// Not a JSON envelope — use raw text.
+			}
+			const title = message.ask === "api_req_failed" ? "API request failed" : "Mistake limit reached"
+			pushFailureToolCall(updates, sessionState, title, displayText, { rawMessage: message.text })
+			break
+		}
 	}
 
 	return { updates, requiresPermission, permissionRequest, toolCallId }

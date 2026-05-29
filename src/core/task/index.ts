@@ -211,6 +211,15 @@ export class Task {
 	// Message and conversation state
 	messageStateHandler: MessageStateHandler
 
+	/**
+	 * Resolves/rejects with the task's startTask/resumeTaskFromHistory lifecycle.
+	 *
+	 * Set by Controller.initTask. Exposed so ACP-style hosts can attach a catch
+	 * handler to surface uncaught task throws (otherwise the startTask promise
+	 * is detached and rejections silently disappear, leaving clients spinning).
+	 */
+	runPromise?: Promise<void>
+
 	// Workspace manager
 	workspaceManager?: WorkspaceRootManager
 
@@ -1815,7 +1824,17 @@ ${notice}`
 			}
 
 			return didEndLoop
-		} catch (_error) {
+		} catch (error) {
+			// Surface the error so ACP-style hosts (which listen for `say:"error"`
+			// to resolve the turn) see something instead of nothing. Without this
+			// the rejection is swallowed, the lifecycle promise resolves cleanly,
+			// and clients only learn anything went wrong via the 60s idle watchdog.
+			Logger.error("[Task] recursivelyMakeDiracRequests failed:", error)
+			try {
+				await this.say("error", error instanceof Error ? error.message : String(error))
+			} catch (sayError) {
+				Logger.error("[Task] Failed to emit error message:", sayError)
+			}
 			return true
 		}
 	}
