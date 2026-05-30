@@ -67,6 +67,8 @@ const GLOBAL_STATE_FIELDS = {
 	dismissedBanners: { default: [] as Array<{ bannerId: string; dismissedAt: number }> },
 	// Path to worktree that should auto-open Dirac sidebar when launched
 	worktreeAutoOpenPath: { default: undefined as string | undefined },
+	// Maps ACP sessionId → ordered list of replacement taskIds (written only for multi-task sessions)
+	acpSessionTasks: { default: {} as Record<string, string[]> },
 } satisfies FieldDefinitions
 
 // Fields that map directly to ApiHandlerOptions in @shared/api.ts
