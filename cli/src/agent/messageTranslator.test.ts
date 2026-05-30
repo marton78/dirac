@@ -730,6 +730,75 @@ describe("translateMessage - say messages", () => {
 			expect(toolCall.title).toContain("/src/b.ts")
 		})
 
+		it("should deduplicate paths in title when path, paths, and readFileResults all reference the same file", () => {
+			const toolInfo = {
+				tool: "readFile",
+				path: "/src/index.ts",
+				paths: ["/src/index.ts"],
+				content: "[File Hash: abc123]\nconst x = 1\n",
+				readFileResults: [{ path: "/src/index.ts", status: "success", label: "Read full file" }],
+			}
+			const message = createDiracMessage({ type: "say", say: "tool", text: JSON.stringify(toolInfo) })
+
+			const result = translateMessage(message, sessionState)
+			const toolCall = result.updates.find((u) => u.sessionUpdate === "tool_call") as acp.ToolCall & {
+				sessionUpdate: "tool_call"
+			}
+
+			expect(toolCall.title).toBe("Read /src/index.ts")
+		})
+
+		it("should format readFile content as hash bullet instead of full source", () => {
+			const toolInfo = {
+				tool: "readFile",
+				path: "/src/index.ts",
+				paths: ["/src/index.ts"],
+				content: "[File Hash: abc123]\nconst x = 1\nexport default x\n",
+				readFileResults: [{ path: "/src/index.ts", status: "success", label: "Read full file" }],
+			}
+			const message = createDiracMessage({ type: "say", say: "tool", text: JSON.stringify(toolInfo) })
+
+			const result = translateMessage(message, sessionState)
+			const update = result.updates.find((u) => u.sessionUpdate === "tool_call_update") as any
+			expect(update).toBeDefined()
+			const contentText = update?.content?.[0]?.content?.text as string
+			expect(contentText).toBe("* /src/index.ts: [File Hash: abc123]")
+			expect(contentText).not.toContain("const x = 1")
+		})
+
+		it("should format listFilesTopLevel content as markdown bullets", () => {
+			const toolInfo = {
+				tool: "listFilesTopLevel",
+				path: ".",
+				content:
+					"Contents of .:\n[Note: sorted by mtime]\n\n3 out of 3 elements listed below:\n\nfoo.ts\nbar.ts\nbaz/",
+			}
+			const message = createDiracMessage({ type: "say", say: "tool", text: JSON.stringify(toolInfo) })
+
+			const result = translateMessage(message, sessionState)
+			const toolCall = result.updates.find((u) => u.sessionUpdate === "tool_call") as any
+			const contentText = toolCall?.content?.[0]?.content?.text as string
+			expect(contentText).toBe("* foo.ts\n* bar.ts\n* baz/")
+			expect(contentText).not.toContain("Contents of")
+			expect(contentText).not.toContain("[Note:")
+		})
+
+		it("should format newFileCreated content as hash bullet instead of full source", () => {
+			const toolInfo = {
+				tool: "newFileCreated",
+				path: "/src/new.ts",
+				content: "[File Hash: def456]\nexport const x = 1\n",
+			}
+			const message = createDiracMessage({ type: "say", say: "tool", text: JSON.stringify(toolInfo) })
+
+			const result = translateMessage(message, sessionState)
+			const update = result.updates.find((u) => u.sessionUpdate === "tool_call_update") as any
+			expect(update).toBeDefined()
+			const contentText = update?.content?.[0]?.content?.text as string
+			expect(contentText).toBe("* /src/new.ts: [File Hash: def456]")
+			expect(contentText).not.toContain("export const")
+		})
+
 		it("should translate say:tool for file edit operations", () => {
 			const toolInfo = {
 				tool: "editedExistingFile",
